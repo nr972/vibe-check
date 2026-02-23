@@ -1,6 +1,6 @@
 {
   "name": "vibe-check",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Security audit skill for Claude Code, built for vibe coders. Scans any codebase for vulnerabilities, hardcoded secrets, and misconfigurations across 40+ frameworks and services.",
   "author": {
     "name": "Noam Raz / Pleasant Secret Labs"

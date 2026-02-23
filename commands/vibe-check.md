@@ -55,6 +55,7 @@ Before scanning, detect the tech stack by checking for these files. Set detectio
 - `docker-compose.yml` with postgres -- PostgreSQL
 - `"@planetscale"` in deps -- PlanetScale
 - `"@neondatabase"` or `"@neon"` in deps -- Neon
+- SQL migration files or `.sql` files containing `CREATE POLICY` or `ENABLE ROW LEVEL SECURITY` -- **PostgreSQL RLS** (flag: `POSTGRES_RLS`). This flag activates RLS-specific checks regardless of whether Supabase is detected, covering direct PostgreSQL, Neon, or any ORM-backed project using Row-Level Security.
 
 **Authentication provider:**
 - `"@clerk"` in deps -- **Clerk** (flag: `CLERK`)
@@ -239,6 +240,18 @@ USING\s*\(\s*true\s*\)
 USING \(true\)
 ```
 Check: are there tables with policies defined but `ENABLE ROW LEVEL SECURITY` never called? (Silent fail-open -- found on 10 tables in one project.)
+
+**RLS recursion risk:** When an RLS policy's `USING` clause subqueries another table, PostgreSQL evaluates *that* table's RLS policies too -- recursively. Two tables whose policies reference each other create infinite recursion, surfacing as 500 errors. Search for policies containing subqueries:
+```
+SELECT tablename, policyname, qual
+FROM pg_policies
+WHERE qual LIKE '%SELECT%FROM%'
+ORDER BY tablename;
+```
+For each result, trace which tables the policy references and check whether those tables' policies reference back. If a cycle exists, it must be broken with a `SECURITY DEFINER` helper function (see Fix Pattern Library). **Warning:** replacing a permissive `USING(true)` policy with a restrictive one can *unmask* latent cycles, because `USING(true)` acts as a circuit breaker that never subqueries other tables.
+
+**If POSTGRES_RLS detected (without Supabase):**
+Run the same RLS checks above -- `SECURITY DEFINER` + `SET search_path`, overly permissive policies, missing `ENABLE ROW LEVEL SECURITY`, and recursion detection -- against any `.sql` or migration files in the project. These issues affect all PostgreSQL RLS users regardless of framework.
 
 **If Firebase detected:**
 Check `firestore.rules` and `storage.rules` -- search for:
@@ -547,7 +560,9 @@ Flag known deprecated/insecure packages:
 
 Run only the subsections matching detected flags.
 
-### 6.1 Supabase Checks (if SUPABASE flag set)
+### 6.1 Supabase / PostgreSQL RLS Checks (if SUPABASE or POSTGRES_RLS flag set)
+
+> **Scope:** RLS-specific checks (Gap Detection, Recursion Detection, SECURITY DEFINER Audit, Testing) run for any project with the `SUPABASE` or `POSTGRES_RLS` flag. Supabase-specific checks (Client-Side Mutations, Edge Function Auth, Service Role Key, Auth method) run only when `SUPABASE` is set.
 
 **RLS Gap Detection:**
 Look for tables in migrations that don't have `ENABLE ROW LEVEL SECURITY`. Then check for overly permissive policies:
@@ -563,7 +578,58 @@ For every SECURITY DEFINER function, verify:
 - Validates caller role
 - Validates all input bounds
 
-**Client-Side Mutations:**
+**RLS Dependency Graph / Recursion Detection:**
+RLS policies that subquery other RLS-protected tables create recursive evaluation chains. PostgreSQL evaluates every referenced table's policies before returning rows, and circular references cause infinite recursion (manifesting as 500 errors or timeouts).
+
+For every table with RLS enabled:
+1. List every table its policies' `USING`/`WITH CHECK` clauses reference (directly via subquery or JOIN)
+2. For each referenced table, list what tables *its* policies reference
+3. Continue until the full dependency graph is mapped or a cycle is found (A→B→A, or longer chains like A→B→C→A)
+
+Detection query:
+```sql
+-- Find all policies with subqueries (potential recursion sources)
+SELECT tablename, policyname, qual
+FROM pg_policies
+WHERE qual LIKE '%SELECT%FROM%'
+ORDER BY tablename;
+
+-- Find tables missing RLS entirely
+SELECT tablename FROM pg_tables
+WHERE schemaname = 'public'
+AND tablename NOT IN (
+  SELECT t.tablename FROM pg_tables t
+  JOIN pg_class c ON c.relname = t.tablename
+  WHERE c.relrowsecurity = true
+);
+```
+
+Common pattern that causes recursion:
+```
+# Two-table cycle (most common)
+Table A policy → subqueries Table B → Table B policy → subqueries Table A
+
+# Example: profiles "Teachers read class students" → JOIN class_students, classes
+# class_students "Teachers read class roster" → subquery on classes
+# classes "Students read enrolled classes" → subquery on class_students
+# Result: class_students ↔ classes infinite recursion, surfacing as 500 on profiles
+```
+
+Fix: replace the subquery in one policy with a `SECURITY DEFINER` helper function (see Fix Pattern Library). `SECURITY DEFINER` functions run as the function owner, bypassing RLS on tables they query internally, which breaks the cycle.
+
+**Critical warning:** Tightening a permissive `USING(true)` policy can *introduce* recursion. `USING(true)` acts as a circuit breaker -- it grants access without querying other tables. Replacing it with a restrictive policy that subqueries another table may unmask a latent circular dependency. Always map the dependency graph before changing any policy.
+
+**Testing RLS Policies:**
+Always test as the actual runtime role, never as superuser (superusers bypass RLS entirely). A query that works in the SQL Editor as `postgres` can return 500 through PostgREST as `authenticated`.
+```sql
+BEGIN;
+SET LOCAL role = 'authenticated';
+SET LOCAL request.jwt.claims = '{"sub": "<user-uuid>", "role": "authenticated"}';
+-- run your queries here and verify expected results
+ROLLBACK;
+```
+
+**Client-Side Mutations (Supabase only):**
 Search for direct `.insert()`, `.update()`, `.delete()` calls from frontend code on sensitive tables. These should be RPC functions instead.
 
 **Edge Function Auth:**
@@ -990,6 +1056,37 @@ END;
 $$;
 REVOKE EXECUTE ON FUNCTION public.my_function FROM public;
 GRANT EXECUTE ON FUNCTION public.my_function TO authenticated;
+```
+
+### SECURITY DEFINER Cycle-Breaker (RLS Recursion Fix)
+Use this lighter pattern to break RLS circular dependencies. The function bypasses RLS internally, returning safe results that other policies can reference without creating cycles.
+```sql
+-- Example: break a cycle where profiles → class_students → classes → class_students
+CREATE OR REPLACE FUNCTION public.get_user_class_ids()
+RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$ SELECT class_id FROM class_students WHERE student_id = auth.uid() $$;
+
+REVOKE EXECUTE ON FUNCTION public.get_user_class_ids() FROM public;
+GRANT EXECUTE ON FUNCTION public.get_user_class_ids() TO authenticated;
+
+-- Then replace the recursive policy subquery:
+-- BEFORE (causes recursion): USING (id IN (SELECT class_id FROM class_students WHERE ...))
+-- AFTER (breaks the cycle):  USING (id IN (SELECT get_user_class_ids()))
+```
+
+### RLS Policy Testing (as authenticated role)
+```sql
+-- Always test RLS as the runtime role, never as superuser
+BEGIN;
+SET LOCAL role = 'authenticated';
+SET LOCAL request.jwt.claims = '{"sub": "<user-uuid>", "role": "authenticated"}';
+
+-- Test your queries here -- they should behave identically to PostgREST/your app
+SELECT * FROM your_table;
+
+ROLLBACK;
 ```
 
 ### Firebase Security Rules Template

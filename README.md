@@ -44,7 +44,7 @@ claude --plugin-dir ./vibe-check
 | Phase | Focus | Modes |
 |-------|-------|-------|
 | 1 | **Secret detection** -- API keys (OpenAI, Stripe, Supabase, Firebase, Clerk, AWS), tokens, passwords, database connection strings, client-side auth secrets | all |
-| 2 | **Critical vulnerabilities** -- auth bypass, SQL/command injection, database security gaps (RLS, Security Rules), webhook signature bypass, privilege escalation, client-side auth logic | all |
+| 2 | **Critical vulnerabilities** -- auth bypass, SQL/command injection, database security gaps (RLS, Security Rules, RLS recursion detection), webhook signature bypass, privilege escalation, client-side auth logic | all |
 | 3 | **OWASP Top 10** -- XSS, IDOR, SSRF, CORS misconfiguration, sensitive data exposure, NoSQL injection, prompt injection | standard, full |
 | 4 | **Input validation** -- length limits, file uploads, rate limiting, weak randomness, redirect validation, postMessage origin checks | standard, full |
 | 5 | **Dependencies** -- `npm audit`, unused packages, hallucinated packages ("slopsquatting"), deprecated libraries, security headers, SRI | standard, full |
@@ -58,7 +58,7 @@ The skill auto-detects your tech stack from `package.json`, config files, and di
 
 **Frontend:** Next.js, React, SvelteKit, Nuxt, Astro, Remix, Angular, Express, Fastify, Django, Flask, Rails
 
-**BaaS / Database:** Supabase, Firebase, Convex, Prisma, Drizzle, MongoDB/Mongoose, PlanetScale, Neon
+**BaaS / Database:** Supabase, Firebase, Convex, Prisma, Drizzle, MongoDB/Mongoose, PlanetScale, Neon, PostgreSQL RLS (auto-detected from migration files)
 
 **Auth:** Clerk, Auth.js/NextAuth, Better Auth, Supabase Auth, Firebase Auth, Lucia (flags as deprecated)
 
@@ -74,7 +74,7 @@ The skill auto-detects your tech stack from `package.json`, config files, and di
 
 | Module | Activates when | Key checks |
 |--------|---------------|------------|
-| Supabase | `@supabase/supabase-js` or `supabase/` dir | RLS gaps, `USING(true)`, SECURITY DEFINER audit, `getUser()` vs `getSession()`, service role key exposure, client-side mutations |
+| Supabase / PostgreSQL RLS | `@supabase/supabase-js`, `supabase/` dir, or SQL files with `CREATE POLICY` | RLS gaps, `USING(true)`, RLS recursion/cycle detection, SECURITY DEFINER audit, RLS policy testing, `getUser()` vs `getSession()`, service role key exposure, client-side mutations |
 | Firebase | `firebase` in deps or `firebase.json` | Security Rules audit (`allow write: if true`), Admin SDK in client code, Firestore write validation |
 | Convex | `convex` in deps or `convex/` dir | Auth in queries/mutations, public vs internal functions, arg validators |
 | Clerk | `@clerk` in deps | Middleware coverage, server-side verification, webhook signature checking |
@@ -103,7 +103,7 @@ This skill was distilled from 19 security documents across 6 production applicat
 
 - **77+ real vulnerability findings** catalogued by severity
 - **Search patterns proven to find real bugs** -- every grep pattern in the skill caught an actual vulnerability
-- **Fix templates from real remediations** -- webhook verification, DOMPurify, SSRF protection, rate limiting, SECURITY DEFINER templates, Firebase Security Rules, auth check patterns for Clerk/Auth.js/Supabase/Firebase
+- **Fix templates from real remediations** -- webhook verification, DOMPurify, SSRF protection, rate limiting, SECURITY DEFINER templates (including RLS cycle-breaker pattern), RLS policy testing, Firebase Security Rules, auth check patterns for Clerk/Auth.js/Supabase/Firebase
 - **Vibe coding anti-patterns** from Wiz Research, Vidoc Security, and Kaspersky -- client-side auth, exposed API keys, slopsquatting, missing input validation
 
 ## Contributing
